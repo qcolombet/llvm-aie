@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Modifications (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its
+// affiliates
+//
 //===----------------------------------------------------------------------===//
 //
 /// \file This file implements the LegalizerHelper class to legalize
@@ -3427,8 +3430,18 @@ LegalizerHelper::LegalizeResult LegalizerHelper::lowerLoad(GAnyLoad &LoadMI) {
       MIRBuilder.buildLoad(LoadReg, PtrReg, *NewMMO);
     }
 
-    if (DstTy != LoadTy)
-      MIRBuilder.buildTrunc(DstReg, LoadReg);
+    if (DstTy != LoadTy) {
+      if (DstTy.isPointer()) {
+        // FIXME: We currently consider this to be illegal for non-integral
+        // address spaces, but we still need a way to reinterpret the bits.
+        Register Trunc =
+            MIRBuilder.buildTrunc(LLT::scalar(DstTy.getSizeInBits()), LoadReg)
+                .getReg(0);
+        MIRBuilder.buildIntToPtr(DstReg, Trunc);
+      } else {
+        MIRBuilder.buildTrunc(DstReg, LoadReg);
+      }
+    }
 
     LoadMI.eraseFromParent();
     return Legalized;
@@ -3927,20 +3940,8 @@ LegalizerHelper::lower(MachineInstr &MI, unsigned TypeIdx, LLT LowerHintTy) {
     return lowerMergeValues(MI);
   case G_UNMERGE_VALUES:
     return lowerUnmergeValues(MI);
-  case TargetOpcode::G_SEXT_INREG: {
-    assert(MI.getOperand(2).isImm() && "Expected immediate");
-    int64_t SizeInBits = MI.getOperand(2).getImm();
-
-    auto [DstReg, SrcReg] = MI.getFirst2Regs();
-    LLT DstTy = MRI.getType(DstReg);
-    Register TmpRes = MRI.createGenericVirtualRegister(DstTy);
-
-    auto MIBSz = MIRBuilder.buildConstant(DstTy, DstTy.getScalarSizeInBits() - SizeInBits);
-    MIRBuilder.buildShl(TmpRes, SrcReg, MIBSz->getOperand(0));
-    MIRBuilder.buildAShr(DstReg, TmpRes, MIBSz->getOperand(0));
-    MI.eraseFromParent();
-    return Legalized;
-  }
+  case TargetOpcode::G_SEXT_INREG:
+    return lowerSextInreg(MI);
   case G_EXTRACT_VECTOR_ELT:
   case G_INSERT_VECTOR_ELT:
     return lowerExtractInsertVectorElt(MI);
@@ -7375,6 +7376,23 @@ LegalizerHelper::lowerUnmergeValues(MachineInstr &MI) {
     MIRBuilder.buildTrunc(MI.getOperand(I), Shift);
   }
 
+  MI.eraseFromParent();
+  return Legalized;
+}
+
+LegalizerHelper::LegalizeResult
+LegalizerHelper::lowerSextInreg(MachineInstr &MI) {
+  assert(MI.getOperand(2).isImm() && "Expected immediate");
+  int64_t SizeInBits = MI.getOperand(2).getImm();
+
+  auto [DstReg, SrcReg] = MI.getFirst2Regs();
+  LLT DstTy = MRI.getType(DstReg);
+  Register TmpRes = MRI.createGenericVirtualRegister(DstTy);
+
+  auto MIBSz =
+      MIRBuilder.buildConstant(DstTy, DstTy.getScalarSizeInBits() - SizeInBits);
+  MIRBuilder.buildShl(TmpRes, SrcReg, MIBSz->getOperand(0));
+  MIRBuilder.buildAShr(DstReg, TmpRes, MIBSz->getOperand(0));
   MI.eraseFromParent();
   return Legalized;
 }

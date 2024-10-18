@@ -4,6 +4,8 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Modifications (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its affiliates
+//
 //===----------------------------------------------------------------------===//
 //
 // This file defines the target-independent interfaces which should be
@@ -244,7 +246,9 @@ class RegisterWithSubRegs<string n, list<Register> subregs> : Register<n> {
 // RegisterClass's and other Operand's.
 class DAGOperand {
   string OperandNamespace = "MCOI";
+  bit DecodeZeroBitOperand = false;
   string DecoderMethod = "";
+  bit hasCompleteDecoder = true;
 }
 
 // RegisterClass - Now that all of the registers are defined, and aliases
@@ -579,6 +583,17 @@ class EncodingByHwMode<list<HwMode> Ms = [], list<InstructionEncoding> Ts = []>
   list<InstructionEncoding> Objects = Ts;
 }
 
+class OperandRegClass<int OperIdx, RegisterClass Reg> {
+  RegisterClass RegClass  = Reg;
+  int OperandIdx = OperIdx;
+}
+
+// Allows to specify instrution Itineraries based on RegClass used 
+class ItinRegClassPair<InstrItinClass Itin, list<OperandRegClass> RegType> {
+  InstrItinClass Itinerary = Itin;
+  list<OperandRegClass> RegTypeList = RegType;
+}
+
 //===----------------------------------------------------------------------===//
 // Instruction set description - These classes correspond to the C++ classes in
 // the Target/TargetInstrInfo.h file.
@@ -618,6 +633,11 @@ class Instruction : InstructionEncoding {
 
   // Added complexity passed onto matching pattern.
   int AddedComplexity  = 0;
+
+  // Passed onto matching pattern and helps in skipping checks
+  // where mayLoad/mayStore is inferred in the instruction but doesn't
+  // mirror in the pattern.
+  bit ModelsInaccessibleMemThroughRegs = false;
 
   // Indicates if this is a pre-isel opcode that should be
   // legalized/regbankselected/selected.
@@ -710,6 +730,7 @@ class Instruction : InstructionEncoding {
   bit hasNoSchedulingInfo = false;
 
   InstrItinClass Itinerary = NoItinerary;// Execution steps used for scheduling.
+  list<ItinRegClassPair> ItineraryRegPairs = [];
 
   // Scheduling information from TargetSchedule.td.
   list<SchedReadWrite> SchedRW;
@@ -998,7 +1019,6 @@ class Operand<ValueType ty> : DAGOperand {
   ValueType Type = ty;
   string PrintMethod = "printOperand";
   string EncoderMethod = "";
-  bit hasCompleteDecoder = true;
   string OperandType = "OPERAND_UNKNOWN";
   dag MIOperandInfo = (ops);
 

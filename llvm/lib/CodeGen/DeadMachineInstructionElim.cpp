@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Modifications (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its
+// affiliates
+//
 //===----------------------------------------------------------------------===//
 //
 // This is an extremely simple MachineInstr-level dead-code-elimination pass.
@@ -33,9 +36,10 @@ class DeadMachineInstructionElimImpl {
   const MachineRegisterInfo *MRI = nullptr;
   const TargetInstrInfo *TII = nullptr;
   LiveRegUnits LivePhysRegs;
+  bool KeepLifetimeInstructions;
 
 public:
-  bool runImpl(MachineFunction &MF);
+  bool runImpl(MachineFunction &MF, bool KeepLifetimeInstructions = false);
 
 private:
   bool isDead(const MachineInstr *MI) const;
@@ -45,15 +49,19 @@ private:
 class DeadMachineInstructionElim : public MachineFunctionPass {
 public:
   static char ID; // Pass identification, replacement for typeid
+  bool KeepLifetimeInstructions;
 
-  DeadMachineInstructionElim() : MachineFunctionPass(ID) {
+  DeadMachineInstructionElim(bool KeepLifetimeInstructions = false)
+      : MachineFunctionPass(ID),
+        KeepLifetimeInstructions(KeepLifetimeInstructions) {
     initializeDeadMachineInstructionElimPass(*PassRegistry::getPassRegistry());
   }
 
   bool runOnMachineFunction(MachineFunction &MF) override {
     if (skipFunction(MF.getFunction()))
       return false;
-    return DeadMachineInstructionElimImpl().runImpl(MF);
+    return DeadMachineInstructionElimImpl().runImpl(MF,
+                                                    KeepLifetimeInstructions);
   }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
@@ -90,6 +98,15 @@ bool DeadMachineInstructionElimImpl::isDead(const MachineInstr *MI) const {
   if (MI->getOpcode() == TargetOpcode::LOCAL_ESCAPE)
     return false;
 
+  // Don't delete marks of start and end of lifetime of a stack, as they give
+  // information about lifetime of stack for next passes.
+  if (KeepLifetimeInstructions) {
+    if (MI->getOpcode() == TargetOpcode::LIFETIME_START ||
+        MI->getOpcode() == TargetOpcode::LIFETIME_END) {
+      return false;
+    }
+  }
+
   // Don't delete instructions with side effects.
   bool SawStore = false;
   if (!MI->isSafeToMove(nullptr, SawStore) && !MI->isPHI())
@@ -99,8 +116,8 @@ bool DeadMachineInstructionElimImpl::isDead(const MachineInstr *MI) const {
   for (const MachineOperand &MO : MI->all_defs()) {
     Register Reg = MO.getReg();
     if (Reg.isPhysical()) {
-      // Don't delete live physreg defs, or any reserved register defs.
-      if (!LivePhysRegs.available(Reg) || MRI->isReserved(Reg))
+      // Don't delete live physreg defs, or any non-simplifiable physreg defs.
+      if (!LivePhysRegs.available(Reg) || !MRI->canSimplifyPhysReg(Reg))
         return false;
     } else {
       if (MO.isDead()) {
@@ -123,12 +140,13 @@ bool DeadMachineInstructionElimImpl::isDead(const MachineInstr *MI) const {
   return true;
 }
 
-bool DeadMachineInstructionElimImpl::runImpl(MachineFunction &MF) {
+bool DeadMachineInstructionElimImpl::runImpl(MachineFunction &MF,
+                                             bool LifetimeInstructions) {
   MRI = &MF.getRegInfo();
-
   const TargetSubtargetInfo &ST = MF.getSubtarget();
   TII = ST.getInstrInfo();
   LivePhysRegs.init(*ST.getRegisterInfo());
+  KeepLifetimeInstructions = LifetimeInstructions;
 
   bool AnyChanges = eliminateDeadMI(MF);
   while (AnyChanges && eliminateDeadMI(MF))
@@ -144,6 +162,14 @@ bool DeadMachineInstructionElimImpl::eliminateDeadMI(MachineFunction &MF) {
   // be cleaned up.
   for (MachineBasicBlock *MBB : post_order(&MF)) {
     LivePhysRegs.addLiveOuts(*MBB);
+
+    // Reserved registers are considered always live, so consider them as
+    // live-outs for MBB. Inside MBB, dead assignments can still be detected.
+    for (MCPhysReg PhysReg : MRI->getReservedRegs().set_bits()) {
+      if (MRI->canSimplifyPhysReg(PhysReg)) {
+        LivePhysRegs.addReg(PhysReg);
+      }
+    }
 
     // Now scan the instructions and delete dead ones, tracking physreg
     // liveness as we go.
@@ -167,3 +193,10 @@ bool DeadMachineInstructionElimImpl::eliminateDeadMI(MachineFunction &MF) {
   LivePhysRegs.clear();
   return AnyChanges;
 }
+
+namespace llvm {
+MachineFunctionPass *
+createDeadMachineInstructionElim(bool KeepLifetimeInstructions = false) {
+  return new DeadMachineInstructionElim(KeepLifetimeInstructions);
+}
+} // end namespace llvm

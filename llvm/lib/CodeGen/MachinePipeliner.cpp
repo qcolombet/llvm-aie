@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Modifications (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its
+// affiliates
+//
 //===----------------------------------------------------------------------===//
 //
 // An implementation of the Swing Modulo Scheduling (SMS) software pipeliner.
@@ -675,10 +678,11 @@ void SwingSchedulerDAG::schedule() {
   }
   // The experimental code generator can't work if there are InstChanges.
   if (ExperimentalCodeGen && NewInstrChanges.empty()) {
-    PeelingModuloScheduleExpander MSE(MF, MS, &LIS);
+    PeelingModuloScheduleExpander MSE(MF, MS, &LIS, LoopPipelinerInfo);
     MSE.expand();
   } else {
-    ModuloScheduleExpander MSE(MF, MS, LIS, std::move(NewInstrChanges));
+    ModuloScheduleExpander MSE(MF, MS, LIS, LoopPipelinerInfo,
+                               std::move(NewInstrChanges));
     MSE.expand();
     MSE.cleanup();
   }
@@ -1156,6 +1160,9 @@ struct FuncUnitSorter {
   }
 };
 
+} // end anonymous namespace
+
+namespace llvm {
 /// Calculate the maximum register pressure of the scheduled instructions stream
 class HighRegisterPressureDetector {
   MachineBasicBlock *OrigMBB;
@@ -1525,7 +1532,7 @@ public:
   }
 };
 
-} // end anonymous namespace
+} // namespace llvm
 
 /// Calculate the resource constrained minimum initiation interval for the
 /// specified loop. We use the DFA to model the resources needed for
@@ -2380,30 +2387,18 @@ void SwingSchedulerDAG::computeNodeOrder(NodeSetType &NodeSets) {
   });
 }
 
-/// Process the nodes in the computed order and create the pipelined schedule
-/// of the instructions, if possible. Return true if a schedule is found.
-bool SwingSchedulerDAG::schedulePipeline(SMSchedule &Schedule) {
+bool SwingSchedulerDAG::tryScheduleWithII(
+    SMSchedule &Schedule, unsigned II, ArrayRef<ArrayRef<SUnit *>> NodeOrders,
+    const HighRegisterPressureDetector *HRPDetector) {
 
-  if (NodeOrder.empty()){
-    LLVM_DEBUG(dbgs() << "NodeOrder is empty! abort scheduling\n" );
-    return false;
-  }
-
-  bool scheduleFound = false;
-  std::unique_ptr<HighRegisterPressureDetector> HRPDetector;
-  if (LimitRegPressure) {
-    HRPDetector =
-        std::make_unique<HighRegisterPressureDetector>(Loop.getHeader(), MF);
-    HRPDetector->init(RegClassInfo);
-  }
-  // Keep increasing II until a valid schedule is found.
-  for (unsigned II = MII; II <= MAX_II && !scheduleFound; ++II) {
+  for (ArrayRef<SUnit *> Order : NodeOrders) {
+    bool scheduleFound = false;
     Schedule.reset();
     Schedule.setInitiationInterval(II);
     LLVM_DEBUG(dbgs() << "Try to schedule with " << II << "\n");
 
-    SetVector<SUnit *>::iterator NI = NodeOrder.begin();
-    SetVector<SUnit *>::iterator NE = NodeOrder.end();
+    ArrayRef<SUnit *>::iterator NI = Order.begin();
+    ArrayRef<SUnit *>::iterator NE = Order.end();
     do {
       SUnit *SU = *NI;
 
@@ -2471,19 +2466,52 @@ bool SwingSchedulerDAG::schedulePipeline(SMSchedule &Schedule) {
           Schedule.normalizeNonPipelinedInstructions(this, LoopPipelinerInfo);
 
     // If a schedule is found, check if it is a valid schedule too.
-    if (scheduleFound)
-      scheduleFound = Schedule.isValidSchedule(this);
+    if (scheduleFound) {
+      scheduleFound = Schedule.isValidSchedule(this) &&
+                      LoopPipelinerInfo->canAcceptII(Schedule);
+    }
 
     // If a schedule was found and the option is enabled, check if the schedule
     // might generate additional register spills/fills.
     if (scheduleFound && LimitRegPressure)
       scheduleFound =
           !HRPDetector->detect(this, Schedule, Schedule.getMaxStageCount());
+
+    if (scheduleFound)
+      return true;
+  }
+
+  // Tried all node orders, no schedule was found.
+  return false;
+}
+
+/// Process the nodes in the computed order and create the pipelined schedule
+/// of the instructions, if possible. Return true if a schedule is found.
+bool SwingSchedulerDAG::schedulePipeline(SMSchedule &Schedule) {
+
+  if (NodeOrder.empty()) {
+    LLVM_DEBUG(dbgs() << "NodeOrder is empty! abort scheduling\n");
+    return false;
+  }
+  SmallVector<ArrayRef<SUnit *>, 4> Orders =
+      LoopPipelinerInfo->getNodeOrders(NodeOrder.getArrayRef(), Topo);
+  LLVM_DEBUG(dbgs() << "Available NodeOrders: " << Orders.size() << "\n");
+
+  bool scheduleFound = false;
+  std::unique_ptr<HighRegisterPressureDetector> HRPDetector;
+  if (LimitRegPressure) {
+    HRPDetector =
+        std::make_unique<HighRegisterPressureDetector>(Loop.getHeader(), MF);
+    HRPDetector->init(RegClassInfo);
+  }
+
+  // Keep increasing II until a valid schedule is found.
+  for (unsigned II = MII; II <= MAX_II && !scheduleFound; ++II) {
+    scheduleFound = tryScheduleWithII(Schedule, II, Orders, HRPDetector.get());
   }
 
   LLVM_DEBUG(dbgs() << "Schedule Found? " << scheduleFound
-                    << " (II=" << Schedule.getInitiationInterval()
-                    << ")\n");
+                    << " (II=" << Schedule.getInitiationInterval() << ")\n");
 
   if (scheduleFound) {
     scheduleFound = LoopPipelinerInfo->shouldUseSchedule(*this, Schedule);
@@ -3485,7 +3513,7 @@ bool ResourceManager::canReserveResources(SUnit &SU, int Cycle) {
   });
   if (UseDFA)
     return DFAResources[positiveModulo(Cycle, InitiationInterval)]
-        ->canReserveResources(&SU.getInstr()->getDesc());
+        ->canReserveResources(*SU.getInstr());
 
   const MCSchedClassDesc *SCDesc = DAG->getSchedClass(&SU);
   if (!SCDesc->isValid()) {
@@ -3511,7 +3539,7 @@ void ResourceManager::reserveResources(SUnit &SU, int Cycle) {
   });
   if (UseDFA)
     return DFAResources[positiveModulo(Cycle, InitiationInterval)]
-        ->reserveResources(&SU.getInstr()->getDesc());
+        ->reserveResources(*SU.getInstr());
 
   const MCSchedClassDesc *SCDesc = DAG->getSchedClass(&SU);
   if (!SCDesc->isValid()) {
@@ -3572,9 +3600,9 @@ bool ResourceManager::isOverbooked() const {
 
 int ResourceManager::calculateResMIIDFA() const {
   assert(UseDFA);
-
   // Sort the instructions by the number of available choices for scheduling,
   // least to most. Use the number of critical resources as the tie breaker.
+  // This gives priority to instructions that are difficult to fit.
   FuncUnitSorter FUS = FuncUnitSorter(*ST);
   for (SUnit &SU : DAG->SUnits)
     FUS.calcCriticalResources(*SU.getInstr());
@@ -3584,48 +3612,32 @@ int ResourceManager::calculateResMIIDFA() const {
   for (SUnit &SU : DAG->SUnits)
     FuncUnitOrder.push(SU.getInstr());
 
-  SmallVector<std::unique_ptr<DFAPacketizer>, 8> Resources;
-  Resources.push_back(
-      std::unique_ptr<DFAPacketizer>(TII->CreateTargetScheduleState(*ST)));
-
+  using UPR = std::unique_ptr<ResourceCycle>;
+  SmallVector<UPR, 8> Resources;
+  // Try to fit all instruction somewhere in the schedule, grow it when
+  // one doesn't fit.
+  // The resulting length of the schedule serves as resource MII
   while (!FuncUnitOrder.empty()) {
     MachineInstr *MI = FuncUnitOrder.top();
     FuncUnitOrder.pop();
+
     if (TII->isZeroCost(MI->getOpcode()))
       continue;
 
-    // Attempt to reserve the instruction in an existing DFA. At least one
-    // DFA is needed for each cycle.
-    unsigned NumCycles = DAG->getSUnit(MI)->Latency;
-    unsigned ReservedCycles = 0;
-    auto *RI = Resources.begin();
-    auto *RE = Resources.end();
-    LLVM_DEBUG({
-      dbgs() << "Trying to reserve resource for " << NumCycles
-             << " cycles for \n";
-      MI->dump();
-    });
-    for (unsigned C = 0; C < NumCycles; ++C)
-      while (RI != RE) {
-        if ((*RI)->canReserveResources(*MI)) {
-          (*RI)->reserveResources(*MI);
-          ++ReservedCycles;
-          break;
-        }
-        RI++;
-      }
-    LLVM_DEBUG(dbgs() << "ReservedCycles:" << ReservedCycles
-                      << ", NumCycles:" << NumCycles << "\n");
-    // Add new DFAs, if needed, to reserve resources.
-    for (unsigned C = ReservedCycles; C < NumCycles; ++C) {
-      LLVM_DEBUG(if (SwpDebugResource) dbgs()
-                 << "NewResource created to reserve resources"
-                 << "\n");
-      auto *NewResource = TII->CreateTargetScheduleState(*ST);
-      assert(NewResource->canReserveResources(*MI) && "Reserve error.");
-      NewResource->reserveResources(*MI);
-      Resources.push_back(std::unique_ptr<DFAPacketizer>(NewResource));
+    auto *Room = find_if(Resources,
+                         [MI](UPR &R) { return R->canReserveResources(*MI); });
+    if (Room != Resources.end()) {
+      (*Room)->reserveResources(*MI);
+      continue;
     }
+    auto *NewResource = TII->CreateTargetScheduleState(*ST);
+    // Please note: This has the sideeffect of setting the slot mapping
+    // for a multi-slot pseudo
+    bool CanReserve = NewResource->canReserveResources(*MI);
+    (void)CanReserve;
+    assert(CanReserve);
+    NewResource->reserveResources(*MI);
+    Resources.emplace_back(NewResource);
   }
 
   int Resmii = Resources.size();

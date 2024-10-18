@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Modifications (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its
+// affiliates
+//
 //===----------------------------------------------------------------------===//
 //
 // This file implements the ScheduleHazardRecognizer class, which implements
@@ -14,9 +17,11 @@
 #ifndef LLVM_CODEGEN_SCHEDULEHAZARDRECOGNIZER_H
 #define LLVM_CODEGEN_SCHEDULEHAZARDRECOGNIZER_H
 
+#include <cassert>
 namespace llvm {
 
 class MachineInstr;
+class MachineBasicBlock;
 class SUnit;
 
 /// HazardRecognizer - This determines whether or not an instruction can be
@@ -57,18 +62,32 @@ public:
   ///     other instruction is available, issue it first.
   ///  * NoopHazard: issuing this instruction would break the program.  If
   ///     some other instruction can be issued, do so, otherwise issue a noop.
-  virtual HazardType getHazardType(SUnit *, int Stalls = 0) {
+  virtual HazardType getHazardType(SUnit *, int DeltaCycles = 0) {
     return NoHazard;
   }
 
+  /// emitNoopsIfNoInstructionsAvailable - This function determines the behavior
+  /// if no instructions are available to execute.  For architectures with
+  /// static compiler pipelines, this should return true.  Most architectures
+  /// with pipeline interlocks can return false.
+  virtual bool emitNoopsIfNoInstructionsAvailable() { return false; }
+
   /// Reset - This callback is invoked when a new block of
-  /// instructions is about to be schedule. The hazard state should be
+  /// instructions is about to be scheduled. The hazard state should be
   /// set to an initialized state.
   virtual void Reset() {}
 
   /// EmitInstruction - This callback is invoked when an instruction is
   /// emitted, to advance the hazard state.
+  /// DeltaCycles is the signed distance from the current cycle where to insert
+  /// the instruction.
   virtual void EmitInstruction(SUnit *) {}
+  /// DeltaCycles is the signed distance from the current cycle where to insert
+  /// the instruction. Override this method if you can deal with DeltaCycles.
+  virtual void EmitInstruction(SUnit *SU, int DeltaCycles) {
+    assert(DeltaCycles == 0);
+    EmitInstruction(SU);
+  }
 
   /// This overload will be used when the hazard recognizer is being used
   /// by a non-scheduling pass, which does not use SUnits.
@@ -122,6 +141,17 @@ public:
     for (unsigned i = 0; i < Quantity; ++i)
       EmitNoop();
   }
+
+  /// BEGIN AIE extension
+  /// These are called at the start and the end of scheduling
+  /// a machine block. They can be used to maintain extra state,
+  /// and do some postprocessing on the reordered code.
+  /// StartBlock is called before any scheduling actions,
+  /// EndBlock is called after reordering the instructions.
+  virtual void StartBlock(MachineBasicBlock *MBB) {}
+
+  virtual void EndBlock(MachineBasicBlock *MBB) {}
+  /// END AIE Extension
 };
 
 } // end namespace llvm

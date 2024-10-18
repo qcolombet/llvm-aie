@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Modifications (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its
+// affiliates
+//
 //===----------------------------------------------------------------------===//
 /// \file
 /// This file implements the IRTranslator class.
@@ -253,6 +256,19 @@ ArrayRef<Register> IRTranslator::getOrCreateVRegs(const Value &Val) {
   return *VRegs;
 }
 
+const Value *IRTranslator::getReturnValueForABI(const ReturnInst &RI) {
+  const Value *RetVal = RI.getReturnValue();
+  if (RetVal && DL->getTypeStoreSize(RetVal->getType()).isZero())
+    return nullptr;
+  return RetVal;
+}
+
+ArrayRef<Register> IRTranslator::getOrCreateReturnVRegs(const Value *RetVal) {
+  if (RetVal)
+    return getOrCreateVRegs(*RetVal);
+  return {};
+}
+
 int IRTranslator::getOrCreateFrameIndex(const AllocaInst &AI) {
   auto MapEntry = FrameIndices.find(&AI);
   if (MapEntry != FrameIndices.end())
@@ -362,13 +378,8 @@ bool IRTranslator::translateCompare(const User &U,
 
 bool IRTranslator::translateRet(const User &U, MachineIRBuilder &MIRBuilder) {
   const ReturnInst &RI = cast<ReturnInst>(U);
-  const Value *Ret = RI.getReturnValue();
-  if (Ret && DL->getTypeStoreSize(Ret->getType()).isZero())
-    Ret = nullptr;
-
-  ArrayRef<Register> VRegs;
-  if (Ret)
-    VRegs = getOrCreateVRegs(*Ret);
+  const Value *Ret = getReturnValueForABI(RI);
+  ArrayRef<Register> VRegs = getOrCreateReturnVRegs(Ret);
 
   Register SwiftErrorVReg = 0;
   if (CLI->supportSwiftError() && SwiftError.getFunctionArg()) {
@@ -1559,9 +1570,6 @@ bool IRTranslator::translateBitCast(const User &U,
 
 bool IRTranslator::translateCast(unsigned Opcode, const User &U,
                                  MachineIRBuilder &MIRBuilder) {
-  if (U.getType()->getScalarType()->isBFloatTy() ||
-      U.getOperand(0)->getType()->getScalarType()->isBFloatTy())
-    return false;
 
   uint32_t Flags = 0;
   if (const Instruction *I = dyn_cast<Instruction>(&U))
@@ -3893,6 +3901,31 @@ bool IRTranslator::runOnMachineFunction(MachineFunction &CurMF) {
     R << "unable to lower function: " << ore::NV("Prototype", F.getType());
     reportTranslationError(*MF, *TPC, *ORE, R);
     return false;
+  }
+
+  if (CLI->mustPreLowerReturn()) {
+    auto FindReturn = [](const Function &F) -> const ReturnInst * {
+      for (const BasicBlock &BB : F) {
+        if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator())) {
+          return RI;
+        }
+      }
+      // The function might have no return instruction, but e.g. just
+      // an unreachable terminator.
+      return nullptr;
+    };
+    if (const ReturnInst *RI = FindReturn(F)) {
+      const Value *RetVal = getReturnValueForABI(*RI);
+      ArrayRef<Register> RetVRegs = getOrCreateReturnVRegs(RetVal);
+      if (!CLI->preLowerReturn(RetVal, RetVRegs, FuncInfo)) {
+        OptimizationRemarkMissed R("gisel-irtranslator", "GISelFailure",
+                                   F.getSubprogram(), &F.getEntryBlock());
+        R << "unable to pre-lower return type: "
+          << ore::NV("Type", F.getType());
+        reportTranslationError(*MF, *TPC, *ORE, R);
+        return false;
+      }
+    }
   }
 
   // Lower the actual args into this basic block.

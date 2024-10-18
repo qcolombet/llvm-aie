@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Modifications (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its
+// affiliates
+//
 //===----------------------------------------------------------------------===//
 //
 // This file describes the target machine instruction set to the code generator.
@@ -39,7 +42,7 @@
 
 namespace llvm {
 
-class DFAPacketizer;
+class ResourceCycle;
 class InstrItineraryData;
 class LiveIntervals;
 class LiveVariables;
@@ -52,6 +55,7 @@ struct MCSchedModel;
 class Module;
 class ScheduleDAG;
 class ScheduleDAGMI;
+class ScheduleDAGTopologicalSort;
 class ScheduleHazardRecognizer;
 class SDNode;
 class SelectionDAG;
@@ -404,6 +408,10 @@ public:
     return true;
   }
 
+  /// Return true if the instruction should be considered for hoisting by
+  /// MachineLICM, even if it is "cheap".
+  virtual bool canHoistCheapInst(const MachineInstr &MI) const { return false; }
+
   /// Re-issue the specified 'original' instruction at the
   /// specific location targeting a new destination register.
   /// The register in Orig->getOperand(0).getReg() will be substituted by
@@ -738,6 +746,14 @@ public:
   /// apply target-specific updates to the loop once pipelining is complete.
   class PipelinerLoopInfo {
   public:
+    /// Return the different node orders to try when looking for a valid
+    /// schedule at a given II.
+    virtual SmallVector<ArrayRef<SUnit *>, 4>
+    getNodeOrders(ArrayRef<SUnit *> DefaultSMSOrder,
+                  const ScheduleDAGTopologicalSort &Topo) {
+      return {DefaultSMSOrder};
+    }
+
     virtual ~PipelinerLoopInfo();
     /// Return true if the given instruction should not be pipelined and should
     /// be ignored. An example could be a loop comparison, or induction variable
@@ -750,6 +766,15 @@ public:
     virtual bool shouldUseSchedule(SwingSchedulerDAG &SSD, SMSchedule &SMS) {
       return true;
     }
+
+    /// Return true if \p SMS can be scheduled and register-allocated by the
+    /// target or false if the II should be increased due to e.g. high register
+    /// pressure.
+    virtual bool canAcceptII(SMSchedule &SMS) { return true; }
+
+    /// This is called from the modulo schedule expander before any other
+    /// modification
+    virtual void startExpand() {}
 
     /// Create a condition to determine if the trip count of the loop is greater
     /// than TC, where TC is always one more than for the previous prologue or
@@ -1910,7 +1935,7 @@ public:
                                          const TargetRegisterInfo *TRI) const {}
 
   /// Create machine specific model for scheduling.
-  virtual DFAPacketizer *
+  virtual ResourceCycle *
   CreateTargetScheduleState(const TargetSubtargetInfo &) const {
     return nullptr;
   }

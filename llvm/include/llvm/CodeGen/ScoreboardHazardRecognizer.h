@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Modifications (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its
+// affiliates
+//
 //===----------------------------------------------------------------------===//
 //
 // This file defines the ScoreboardHazardRecognizer class, which
@@ -20,16 +23,18 @@
 #include <cassert>
 #include <cstddef>
 #include <cstring>
+#include <vector>
 
 namespace llvm {
 
+class MCInstrDesc;
 class ScheduleDAG;
 class SUnit;
 
 class ScoreboardHazardRecognizer : public ScheduleHazardRecognizer {
   // Scoreboard to track function unit usage. Scoreboard[0] is a
   // mask of the FUs in use in the cycle currently being
-  // schedule. Scoreboard[1] is a mask for the next cycle. The
+  // scheduled. Scoreboard[1] is a mask for the next cycle. The
   // Scoreboard is used as a circular buffer with the current cycle
   // indicated by Head.
   //
@@ -37,7 +42,7 @@ class ScoreboardHazardRecognizer : public ScheduleHazardRecognizer {
   // bottom-up scheduler, then the scoreboard cycles are the inverse of the
   // scheduler's cycles.
   class Scoreboard {
-    InstrStage::FuncUnits *Data = nullptr;
+    std::vector<InstrStage::FuncUnits> Data;
 
     // The maximum number of cycles monitored by the Scoreboard. This
     // value is determined based on the target itineraries to ensure
@@ -49,15 +54,10 @@ class ScoreboardHazardRecognizer : public ScheduleHazardRecognizer {
 
   public:
     Scoreboard() = default;
-    Scoreboard &operator=(const Scoreboard &other) = delete;
-    Scoreboard(const Scoreboard &other) = delete;
-    ~Scoreboard() {
-      delete[] Data;
-    }
 
     size_t getDepth() const { return Depth; }
 
-    InstrStage::FuncUnits& operator[](size_t idx) const {
+    const InstrStage::FuncUnits &operator[](size_t idx) const {
       // Depth is expected to be a power-of-2.
       assert(Depth && !(Depth & (Depth - 1)) &&
              "Scoreboard was not initialized properly!");
@@ -65,13 +65,16 @@ class ScoreboardHazardRecognizer : public ScheduleHazardRecognizer {
       return Data[(Head + idx) & (Depth-1)];
     }
 
-    void reset(size_t d = 1) {
-      if (!Data) {
-        Depth = d;
-        Data = new InstrStage::FuncUnits[Depth];
-      }
+    InstrStage::FuncUnits &operator[](size_t idx) {
+      return const_cast<InstrStage::FuncUnits &>(
+          static_cast<const Scoreboard *>(this)->operator[](idx));
+    }
 
-      memset(Data, 0, Depth * sizeof(Data[0]));
+    void reset(size_t d = 1) {
+      if (Data.empty())
+        Depth = d;
+      Data.clear();
+      Data.resize(Depth, 0);
       Head = 0;
     }
 
@@ -117,10 +120,18 @@ public:
   // Stalls provides an cycle offset at which SU will be scheduled. It will be
   // negative for bottom-up scheduling.
   HazardType getHazardType(SUnit *SU, int Stalls) override;
+  // This is an overload taking a schedclass. This is the actual
+  // implementation of the wrapper above which just traverses from
+  // the SU to the corresponding SchedClass.
+  HazardType getHazardType(unsigned SchedClass, int Stalls);
   void Reset() override;
   void EmitInstruction(SUnit *SU) override;
+  void EmitInstruction(SUnit *SU, int DeltaCycles) override;
   void AdvanceCycle() override;
   void RecedeCycle() override;
+
+protected:
+  void EmitInstructionWithDesc(const MCInstrDesc *MCID, int DeltaCycles = 0);
 };
 
 } // end namespace llvm

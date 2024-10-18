@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Modifications (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its
+// affiliates
+//
 //===----------------------------------------------------------------------===//
 //
 /// \file Implements the ScheduleDAGInstrs class, which implements scheduling
@@ -265,6 +268,10 @@ namespace llvm {
     /// Set of live physical registers for updating kill flags.
     LiveRegUnits LiveRegs;
 
+    /// Default implementation for nextBlock()
+    MachineFunction *CurrFunc;
+    MachineFunction::iterator NextMBB;
+
   public:
     explicit ScheduleDAGInstrs(MachineFunction &mf,
                                const MachineLoopInfo *mli,
@@ -274,6 +281,8 @@ namespace llvm {
 
     /// Gets the machine model for instruction scheduling.
     const TargetSchedModel *getSchedModel() const { return &SchedModel; }
+
+    MachineBasicBlock *getBB() const { return BB; }
 
     /// Resolves and cache a resolved scheduling class for an SUnit.
     const MCSchedClassDesc *getSchedClass(SUnit *SU) const {
@@ -292,9 +301,6 @@ namespace llvm {
 
     /// Returns an iterator to the bottom of the current scheduling region.
     MachineBasicBlock::iterator end() const { return RegionEnd; }
-
-    /// Creates a new SUnit and return a ptr to it.
-    SUnit *newSUnit(MachineInstr *MI);
 
     /// Returns an existing SUnit for this MI, or nullptr.
     SUnit *getSUnit(MachineInstr *MI) const;
@@ -322,7 +328,7 @@ namespace llvm {
     /// Called when the scheduler has finished scheduling the current region.
     virtual void exitRegion();
 
-    /// Builds SUnits for the current region.
+    /// Builds SUnits for the current region and computes the edges.
     /// If \p RPTracker is non-null, compute register pressure as a side effect.
     /// The DAG builder is an efficient place to do it because it already visits
     /// operands.
@@ -331,6 +337,17 @@ namespace llvm {
                          PressureDiffs *PDiffs = nullptr,
                          LiveIntervals *LIS = nullptr,
                          bool TrackLaneMasks = false);
+
+    // Make reverse-lookup maps
+    void makeMaps();
+    void setExitSU();
+    void recordDbgInstrs();
+
+    /// Computes the edges by tracking the read and write events in a backward
+    /// traversal of the SUnits vector.
+    void buildEdges(AAResults *AA, RegPressureTracker *RPTracker = nullptr,
+                    PressureDiffs *PDiffs = nullptr,
+                    LiveIntervals *LIS = nullptr, bool TrackLaneMasks = false);
 
     /// Adds dependencies from instructions in the current list of
     /// instructions being scheduled to scheduling barrier. We want to make sure
@@ -346,6 +363,18 @@ namespace llvm {
     /// Typically, a scheduling algorithm will implement schedule() without
     /// overriding enterRegion() or exitRegion().
     virtual void schedule() = 0;
+
+    /// Next block to schedule. Returns nullptr when done. It is explicitly
+    /// allowed to schedule blocks more than once.
+    virtual MachineBasicBlock *nextBlock() {
+      return NextMBB == CurrFunc->end() ? nullptr : &(*NextMBB++);
+    }
+
+    /// Function-wide initialization
+    virtual void startSchedule(MachineFunction *MF) {
+      CurrFunc = MF;
+      NextMBB = MF->begin();
+    }
 
     /// Allow targets to perform final scheduling actions at the level of the
     /// whole MachineFunction. By default does nothing.
@@ -367,6 +396,15 @@ namespace llvm {
     /// a cycle.
     bool canAddEdge(SUnit *SuccSU, SUnit *PredSU);
 
+    // Create the SUnit for MI. This method should be called for each
+    // instruction in original forward order. Returns a unique index if
+    // successful, none otherwise.
+    // The index coincides with the SUnit's NodeNum and can be used to index the
+    // SUnits vector.
+    // The only case it fails is when trying to initialize a debug or
+    // pseudo instruction.
+    std::optional<unsigned> initSUnit(MachineInstr &MI);
+
     /// Add a DAG edge to the given SU with the given predecessor
     /// dependence data.
     ///
@@ -374,8 +412,23 @@ namespace llvm {
     /// equivalent edge already existed (false indicates failure).
     bool addEdge(SUnit *SuccSU, const SDep &PredDep);
 
+    /// Register def/use events in MI.
+    /// Record defs, then uses, then create an edge for each
+    /// detected dependence.
+    /// Returns whether it contains virtual register definitions.
+    /// This method is meant to be used from a backward traversal of the
+    /// instructions.
+    bool handleRegEvents(SUnit *SU);
+
   protected:
+    // Modify Dep and add it as predecessor
+    virtual void adjustAndAddPred(SUnit *DstSU, SDep &Dep, int SrcIdx,
+                                  int DstIdx,
+                                  const TargetSchedModel *SchedModel);
+
+    // Create the SUnits vector
     void initSUnits();
+
     void addPhysRegDataDeps(SUnit *SU, unsigned OperIdx);
     void addPhysRegDeps(SUnit *SU, unsigned OperIdx);
     void addVRegDefDeps(SUnit *SU, unsigned OperIdx);
@@ -388,17 +441,6 @@ namespace llvm {
     /// Returns true if the def register in \p MO has no uses.
     bool deadDefHasNoUse(const MachineOperand &MO);
   };
-
-  /// Creates a new SUnit and return a ptr to it.
-  inline SUnit *ScheduleDAGInstrs::newSUnit(MachineInstr *MI) {
-#ifndef NDEBUG
-    const SUnit *Addr = SUnits.empty() ? nullptr : &SUnits[0];
-#endif
-    SUnits.emplace_back(MI, (unsigned)SUnits.size());
-    assert((Addr == nullptr || Addr == &SUnits[0]) &&
-           "SUnits std::vector reallocated on the fly!");
-    return &SUnits.back();
-  }
 
   /// Returns an existing SUnit for this MI, or nullptr.
   inline SUnit *ScheduleDAGInstrs::getSUnit(MachineInstr *MI) const {

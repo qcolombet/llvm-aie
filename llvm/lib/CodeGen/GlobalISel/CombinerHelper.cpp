@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Modifications (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its
+// affiliates
+//
 //===----------------------------------------------------------------------===//
 #include "llvm/CodeGen/GlobalISel/CombinerHelper.h"
 #include "llvm/ADT/APFloat.h"
@@ -22,6 +25,7 @@
 #include "llvm/CodeGen/LowLevelTypeUtils.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineMemOperand.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
@@ -7248,4 +7252,39 @@ bool CombinerHelper::matchAddOverflow(MachineInstr &MI, BuildFnTy &MatchInfo) {
   }
 
   return false;
+}
+
+bool CombinerHelper::matchIntToPtrContant(MachineInstr &MI,
+                                          MachineRegisterInfo &MRI,
+                                          BuildFnTy &MatchInfo) {
+
+  assert(MI.getOpcode() == TargetOpcode::G_INTTOPTR);
+
+  Register DstReg = MI.getOperand(0).getReg();
+  LLT CastType = MRI.getType(DstReg);
+  const DataLayout &DL = Builder.getMF().getDataLayout();
+
+  if (DL.isNonIntegralAddressSpace(CastType.getScalarType().getAddressSpace()))
+    return false;
+
+  Register SrcReg = MI.getOperand(1).getReg();
+  auto CstVal = getIConstantVRegValWithLookThrough(SrcReg, MRI);
+
+  if (!CstVal)
+    return false;
+
+  LLT ConstantType = MRI.getType(CstVal->VReg);
+
+  if (DL.getPointerSizeInBits(CastType.getScalarType().getAddressSpace()) !=
+      ConstantType.getScalarSizeInBits())
+    return false;
+
+  if (!isConstantLegalOrBeforeLegalizer(CastType))
+    return false;
+
+  MatchInfo = [=](MachineIRBuilder &B) {
+    B.buildConstant(DstReg, CstVal->Value);
+  };
+
+  return true;
 }

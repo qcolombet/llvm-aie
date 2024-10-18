@@ -4,6 +4,8 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Modifications (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its affiliates
+//
 //===----------------------------------------------------------------------===//
 
 //===----------------------------------------------------------------------===//
@@ -549,7 +551,9 @@ def VRM8 : VReg<VM8VTs, (add V8M8, V16M8, V24M8, V0M8), 8>;
 
 def VRM8NoV0 : VReg<VM8VTs, (sub VRM8, V0M8), 8>;
 
-def VMV0 : VReg<VMaskVTs, (add V0), 1>;
+def VMV0 : VReg<VMaskVTs, (add V0), 1> {
+  let DecodeZeroBitOperand = true;
+}
 
 let RegInfos = XLenRI in {
 def GPRF16  : RISCVRegisterClass<[f16], 16, (add GPR)>;

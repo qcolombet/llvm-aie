@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Modifications (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its
+// affiliates
+//
 //===----------------------------------------------------------------------===//
 //
 /// \file This implements the ScheduleDAGInstrs class, which implements
@@ -200,12 +203,17 @@ void ScheduleDAGInstrs::exitRegion() {
   // Nothing to do.
 }
 
+void ScheduleDAGInstrs::adjustAndAddPred(SUnit *DstSU, SDep &Dep, int SrcIdx,
+                                         int DstIdx,
+                                         const TargetSchedModel *SchedModel) {
+  const TargetSubtargetInfo &ST = MF.getSubtarget();
+  ST.adjustSchedDependency(Dep.getSUnit(), SrcIdx, DstSU, DstIdx, Dep,
+                           SchedModel);
+  DstSU->addPred(Dep);
+}
+
 void ScheduleDAGInstrs::addSchedBarrierDeps() {
-  MachineInstr *ExitMI =
-      RegionEnd != BB->end()
-          ? &*skipDebugInstructionsBackward(RegionEnd, RegionBegin)
-          : nullptr;
-  ExitSU.setInstr(ExitMI);
+  MachineInstr *ExitMI = ExitSU.getInstr();
   // Add dependencies on the defs and uses of the instruction.
   if (ExitMI) {
     for (const MachineOperand &MO : ExitMI->all_uses()) {
@@ -217,6 +225,13 @@ void ScheduleDAGInstrs::addSchedBarrierDeps() {
         addVRegUseDeps(&ExitSU, MO.getOperandNo());
       }
     }
+  }
+
+  // DAG construction can run with BB = nullptr. In that mode, the region
+  // is fully defined by its SUnits, ExitSU and EntrySU, and the caller doesn't
+  // rely on BB or region iterators.
+  if (!BB) {
+    return;
   }
   if (!ExitMI || (!ExitMI->isCall() && !ExitMI->isBarrier())) {
     // For others, e.g. fallthrough, conditional branch, assume the exit
@@ -241,7 +256,6 @@ void ScheduleDAGInstrs::addPhysRegDataDeps(SUnit *SU, unsigned OperIdx) {
   Register Reg = MO.getReg();
 
   // Ask the target if address-backscheduling is desirable, and if so how much.
-  const TargetSubtargetInfo &ST = MF.getSubtarget();
 
   // Only use any non-zero latency for real defs/uses, in contrast to
   // "fake" operands added by regalloc.
@@ -282,8 +296,7 @@ void ScheduleDAGInstrs::addPhysRegDataDeps(SUnit *SU, unsigned OperIdx) {
       } else {
         Dep.setLatency(0);
       }
-      ST.adjustSchedDependency(SU, OperIdx, UseSU, UseOpIdx, Dep, &SchedModel);
-      UseSU->addPred(Dep);
+      adjustAndAddPred(UseSU, Dep, OperIdx, UseOpIdx, &SchedModel);
     }
   }
 }
@@ -298,8 +311,6 @@ void ScheduleDAGInstrs::addPhysRegDeps(SUnit *SU, unsigned OperIdx) {
   // We do not need to track any dependencies for constant registers.
   if (MRI.isConstantPhysReg(Reg))
     return;
-
-  const TargetSubtargetInfo &ST = MF.getSubtarget();
 
   // Optionally add output and anti dependencies. For anti
   // dependencies we use a latency of 0 because for a multi-issue
@@ -319,13 +330,10 @@ void ScheduleDAGInstrs::addPhysRegDeps(SUnit *SU, unsigned OperIdx) {
       if (DefSU != SU &&
           (Kind != SDep::Output || !MO.isDead() || !DefMO.isDead())) {
         SDep Dep(SU, Kind, DefMO.getReg());
-        if (Kind != SDep::Anti) {
+        if (Kind != SDep::Anti)
           Dep.setLatency(
-              SchedModel.computeOutputLatency(MI, OperIdx, DefInstr));
-        }
-        ST.adjustSchedDependency(SU, OperIdx, DefSU, I->OpIdx, Dep,
-                                 &SchedModel);
-        DefSU->addPred(Dep);
+              SchedModel.computeOutputLatency(MI, OperIdx, DefSU->getInstr()));
+        adjustAndAddPred(DefSU, Dep, OperIdx, I->OpIdx, &SchedModel);
       }
     }
   }
@@ -438,7 +446,6 @@ void ScheduleDAGInstrs::addVRegDefDeps(SUnit *SU, unsigned OperIdx) {
     assert(deadDefHasNoUse(MO) && "Dead defs should have no uses");
   } else {
     // Add data dependence to all uses we found so far.
-    const TargetSubtargetInfo &ST = MF.getSubtarget();
     for (VReg2SUnitOperIdxMultiMap::iterator I = CurrentVRegUses.find(Reg),
          E = CurrentVRegUses.end(); I != E; /*empty*/) {
       LaneBitmask LaneMask = I->LaneMask;
@@ -454,9 +461,7 @@ void ScheduleDAGInstrs::addVRegDefDeps(SUnit *SU, unsigned OperIdx) {
         SDep Dep(SU, SDep::Data, Reg);
         Dep.setLatency(SchedModel.computeOperandLatency(MI, OperIdx, Use,
                                                         I->OperandIndex));
-        ST.adjustSchedDependency(SU, OperIdx, UseSU, I->OperandIndex, Dep,
-                                 &SchedModel);
-        UseSU->addPred(Dep);
+        adjustAndAddPred(UseSU, Dep, OperIdx, I->OperandIndex, &SchedModel);
       }
 
       LaneMask &= ~KillLaneMask;
@@ -543,7 +548,8 @@ void ScheduleDAGInstrs::addVRegUseDeps(SUnit *SU, unsigned OperIdx) {
     if (V2SU.SU == SU)
       continue;
 
-    V2SU.SU->addPred(SDep(SU, SDep::Anti, Reg));
+    SDep Dep(SU, SDep::Anti, Reg);
+    V2SU.SU->addPred(Dep);
   }
 }
 
@@ -575,50 +581,104 @@ void ScheduleDAGInstrs::addChainDependency (SUnit *SUa, SUnit *SUb,
 ///
 /// MachineScheduler relies on initSUnits numbering the nodes by their order in
 /// the original instruction list.
-void ScheduleDAGInstrs::initSUnits() {
-  // We'll be allocating one SUnit for each real instruction in the region,
-  // which is contained within a basic block.
-  SUnits.reserve(NumRegionInstrs);
+///
+/// DAG construction and other data dependence analysis need an SUnit for each
+/// MachineInstr. By separating the initialization to the address export, we
+/// allow to initialize SUnits without prior knowledge of the size. We just
+/// require all relevant instruction to be registered before starting DAG
+/// construction
 
-  for (MachineInstr &MI : make_range(RegionBegin, RegionEnd)) {
-    if (MI.isDebugOrPseudoInstr())
-      continue;
+std::optional<unsigned> ScheduleDAGInstrs::initSUnit(MachineInstr &MI) {
+  if (MI.isDebugOrPseudoInstr())
+    return {};
 
-    SUnit *SU = newSUnit(&MI);
-    MISUnitMap[&MI] = SU;
+  SUnit &SU = SUnits.emplace_back(&MI, (unsigned)SUnits.size());
+  SU.isCall = MI.isCall();
+  SU.isCommutable = MI.isCommutable();
 
-    SU->isCall = MI.isCall();
-    SU->isCommutable = MI.isCommutable();
+  // Assign the Latency field of SU using target-provided information.
+  SU.Latency = SchedModel.computeInstrLatency(SU.getInstr());
 
-    // Assign the Latency field of SU using target-provided information.
-    SU->Latency = SchedModel.computeInstrLatency(SU->getInstr());
-
-    // If this SUnit uses a reserved or unbuffered resource, mark it as such.
-    //
-    // Reserved resources block an instruction from issuing and stall the
-    // entire pipeline. These are identified by BufferSize=0.
-    //
-    // Unbuffered resources prevent execution of subsequent instructions that
-    // require the same resources. This is used for in-order execution pipelines
-    // within an out-of-order core. These are identified by BufferSize=1.
-    if (SchedModel.hasInstrSchedModel()) {
-      const MCSchedClassDesc *SC = getSchedClass(SU);
-      for (const MCWriteProcResEntry &PRE :
-           make_range(SchedModel.getWriteProcResBegin(SC),
-                      SchedModel.getWriteProcResEnd(SC))) {
-        switch (SchedModel.getProcResource(PRE.ProcResourceIdx)->BufferSize) {
-        case 0:
-          SU->hasReservedResource = true;
-          break;
-        case 1:
-          SU->isUnbuffered = true;
-          break;
-        default:
-          break;
-        }
+  // If this SUnit uses a reserved or unbuffered resource, mark it as such.
+  //
+  // Reserved resources block an instruction from issuing and stall the
+  // entire pipeline. These are identified by BufferSize=0.
+  //
+  // Unbuffered resources prevent execution of subsequent instructions that
+  // require the same resources. This is used for in-order execution pipelines
+  // within an out-of-order core. These are identified by BufferSize=1.
+  if (SchedModel.hasInstrSchedModel()) {
+    const MCSchedClassDesc *SC = getSchedClass(&SU);
+    for (const MCWriteProcResEntry &PRE :
+         make_range(SchedModel.getWriteProcResBegin(SC),
+                    SchedModel.getWriteProcResEnd(SC))) {
+      switch (SchedModel.getProcResource(PRE.ProcResourceIdx)->BufferSize) {
+      case 0:
+        SU.hasReservedResource = true;
+        break;
+      case 1:
+        SU.isUnbuffered = true;
+        break;
+      default:
+        break;
       }
     }
   }
+  return SU.NodeNum;
+}
+
+void ScheduleDAGInstrs::initSUnits() {
+  ScheduleDAG::clearDAG();
+  // Prevent reallocations for performance.
+  SUnits.reserve(NumRegionInstrs);
+  // This loop creates SUnits for real instructions.
+  for (MachineInstr &MI : make_range(RegionBegin, RegionEnd)) {
+    initSUnit(MI);
+  }
+}
+
+void ScheduleDAGInstrs::makeMaps() {
+  // At this point we have all SUnits allocated and their addresses are stable.
+  // We can now safely export them.
+  MISUnitMap.clear();
+  for (auto &SU : SUnits) {
+    MISUnitMap[SU.getInstr()] = &SU;
+  }
+}
+
+void ScheduleDAGInstrs::setExitSU() {
+  // Set the exit instruction. If we have a bb, we take it from there.
+  MachineInstr *ExitMI =
+      BB ? RegionEnd != BB->end()
+               ? &*skipDebugInstructionsBackward(RegionEnd, RegionBegin)
+               : nullptr
+         : nullptr;
+  ExitSU.setInstr(ExitMI);
+}
+
+void ScheduleDAGInstrs::recordDbgInstrs() {
+  // Remove any stale debug info; sometimes BuildSchedGraph is called again
+  // without emitting the info from the previous call.
+  DbgValues.clear();
+  FirstDbgValue = nullptr;
+
+  // We connect any Debug machine instruction to the instruction before it.
+  // if there is no instruction before it, it is recorded in FirstDbgValue;
+  MachineInstr *DbgMI = nullptr;
+  for (MachineBasicBlock::iterator MII = RegionEnd, MIE = RegionBegin;
+       MII != MIE; --MII) {
+    MachineInstr &MI = *std::prev(MII);
+    if (DbgMI) {
+      DbgValues.emplace_back(DbgMI, &MI);
+      DbgMI = nullptr;
+    }
+
+    if (MI.isDebugValue() || MI.isDebugPHI()) {
+      DbgMI = &MI;
+    }
+  }
+  if (DbgMI)
+    FirstDbgValue = DbgMI;
 }
 
 class ScheduleDAGInstrs::Value2SUsMap : public MapVector<ValueType, SUList> {
@@ -736,24 +796,70 @@ void ScheduleDAGInstrs::insertBarrierChain(Value2SUsMap &map) {
   map.reComputeSize();
 }
 
+bool ScheduleDAGInstrs::handleRegEvents(SUnit *SU) {
+  // Add register-based dependencies (data, anti, and output).
+  // For some instructions (calls, returns, inline-asm, etc.) there can
+  // be explicit uses and implicit defs, in which case the use will appear
+  // on the operand list before the def. Do two passes over the operand
+  // list to make sure that defs are processed before any uses.
+  MachineInstr &MI = *SU->getInstr();
+  bool HasVRegDef = false;
+  const unsigned N = MI.getNumOperands();
+  for (unsigned OpIdx = 0; OpIdx != N; ++OpIdx) {
+    const MachineOperand &MO = MI.getOperand(OpIdx);
+    if (!MO.isReg() || !MO.isDef())
+      continue;
+    Register Reg = MO.getReg();
+    if (Reg.isPhysical()) {
+      addPhysRegDeps(SU, OpIdx);
+    } else if (Reg.isVirtual()) {
+      HasVRegDef = true;
+      addVRegDefDeps(SU, OpIdx);
+    }
+  }
+
+  // Now process all uses.
+  for (unsigned OpIdx = 0; OpIdx != N; ++OpIdx) {
+    const MachineOperand &MO = MI.getOperand(OpIdx);
+    // Only look at use operands.
+    // We do not need to check for MO.readsReg() here because subsequent
+    // subregister defs will get output dependence edges and need no
+    // additional use dependencies.
+    if (!MO.isReg() || !MO.isUse())
+      continue;
+    Register Reg = MO.getReg();
+    if (Reg.isPhysical()) {
+      addPhysRegDeps(SU, OpIdx);
+    } else if (Reg.isVirtual() && MO.readsReg()) {
+      addVRegUseDeps(SU, OpIdx);
+    }
+  }
+  return HasVRegDef;
+}
+
 void ScheduleDAGInstrs::buildSchedGraph(AAResults *AA,
                                         RegPressureTracker *RPTracker,
                                         PressureDiffs *PDiffs,
                                         LiveIntervals *LIS,
                                         bool TrackLaneMasks) {
+  // Create an SUnit for each real instruction.
+  initSUnits();
+  setExitSU();
+  makeMaps();
+  recordDbgInstrs();
+  buildEdges(AA, RPTracker, PDiffs, LIS, TrackLaneMasks);
+}
+
+void ScheduleDAGInstrs::buildEdges(AAResults *AA, RegPressureTracker *RPTracker,
+                                   PressureDiffs *PDiffs, LiveIntervals *LIS,
+                                   bool TrackLaneMasks) {
+
   const TargetSubtargetInfo &ST = MF.getSubtarget();
   bool UseAA = EnableAASchedMI.getNumOccurrences() > 0 ? EnableAASchedMI
                                                        : ST.useAA();
   AAForDep = UseAA ? AA : nullptr;
-
   BarrierChain = nullptr;
-
   this->TrackLaneMasks = TrackLaneMasks;
-  MISUnitMap.clear();
-  ScheduleDAG::clearDAG();
-
-  // Create an SUnit for each real instruction.
-  initSUnits();
 
   if (PDiffs)
     PDiffs->init(SUnits.size());
@@ -786,11 +892,6 @@ void ScheduleDAGInstrs::buildSchedGraph(AAResults *AA,
   // convenience.
   Value2SUsMap FPExceptions;
 
-  // Remove any stale debug info; sometimes BuildSchedGraph is called again
-  // without emitting the info from the previous call.
-  DbgValues.clear();
-  FirstDbgValue = nullptr;
-
   assert(Defs.empty() && Uses.empty() &&
          "Only BuildGraph should update Defs/Uses");
   Defs.setUniverse(TRI->getNumRegs());
@@ -806,26 +907,10 @@ void ScheduleDAGInstrs::buildSchedGraph(AAResults *AA,
   // ExitSU.
   addSchedBarrierDeps();
 
-  // Walk the list of instructions, from bottom moving up.
-  MachineInstr *DbgMI = nullptr;
-  for (MachineBasicBlock::iterator MII = RegionEnd, MIE = RegionBegin;
-       MII != MIE; --MII) {
-    MachineInstr &MI = *std::prev(MII);
-    if (DbgMI) {
-      DbgValues.emplace_back(DbgMI, &MI);
-      DbgMI = nullptr;
-    }
-
-    if (MI.isDebugValue() || MI.isDebugPHI()) {
-      DbgMI = &MI;
-      continue;
-    }
-
-    if (MI.isDebugLabel() || MI.isDebugRef() || MI.isPseudoProbe())
-      continue;
-
-    SUnit *SU = MISUnitMap[&MI];
-    assert(SU && "No SUnit mapped to this MI");
+  // Walk the list of real instructions, from bottom moving up.
+  for (auto &SUR : reverse(SUnits)) {
+    auto *SU = &SUR;
+    MachineInstr &MI = *SU->getInstr();
 
     if (RPTracker) {
       RegisterOperands RegOpers;
@@ -847,40 +932,9 @@ void ScheduleDAGInstrs::buildSchedGraph(AAResults *AA,
         (CanHandleTerminators || (!MI.isTerminator() && !MI.isPosition())) &&
         "Cannot schedule terminators or labels!");
 
-    // Add register-based dependencies (data, anti, and output).
-    // For some instructions (calls, returns, inline-asm, etc.) there can
-    // be explicit uses and implicit defs, in which case the use will appear
-    // on the operand list before the def. Do two passes over the operand
-    // list to make sure that defs are processed before any uses.
-    bool HasVRegDef = false;
-    for (unsigned j = 0, n = MI.getNumOperands(); j != n; ++j) {
-      const MachineOperand &MO = MI.getOperand(j);
-      if (!MO.isReg() || !MO.isDef())
-        continue;
-      Register Reg = MO.getReg();
-      if (Reg.isPhysical()) {
-        addPhysRegDeps(SU, j);
-      } else if (Reg.isVirtual()) {
-        HasVRegDef = true;
-        addVRegDefDeps(SU, j);
-      }
-    }
-    // Now process all uses.
-    for (unsigned j = 0, n = MI.getNumOperands(); j != n; ++j) {
-      const MachineOperand &MO = MI.getOperand(j);
-      // Only look at use operands.
-      // We do not need to check for MO.readsReg() here because subsequent
-      // subregister defs will get output dependence edges and need no
-      // additional use dependencies.
-      if (!MO.isReg() || !MO.isUse())
-        continue;
-      Register Reg = MO.getReg();
-      if (Reg.isPhysical()) {
-        addPhysRegDeps(SU, j);
-      } else if (Reg.isVirtual() && MO.readsReg()) {
-        addVRegUseDeps(SU, j);
-      }
-    }
+    /// Compute register dependences, calling back into reportDependence
+    /// whenever a dependence is detected.
+    const bool HasVRegDef = handleRegEvents(SU);
 
     // If we haven't seen any uses in this scheduling region, create a
     // dependence edge to ExitSU to model the live-out latency. This is required
@@ -1020,9 +1074,6 @@ void ScheduleDAGInstrs::buildSchedGraph(AAResults *AA,
       reduceHugeMemNodeMaps(NonAliasStores, NonAliasLoads, getReductionSize());
     }
   }
-
-  if (DbgMI)
-    FirstDbgValue = DbgMI;
 
   Defs.clear();
   Uses.clear();
@@ -1227,7 +1278,8 @@ bool ScheduleDAGInstrs::addEdge(SUnit *SuccSU, const SDep &PredDep) {
       return false;
     Topo.AddPredQueued(SuccSU, PredDep.getSUnit());
   }
-  SuccSU->addPred(PredDep, /*Required=*/!PredDep.isArtificial());
+  SDep ByValue(PredDep);
+  SuccSU->addPred(ByValue, /*Required=*/!PredDep.isArtificial());
   // Return true regardless of whether a new edge needed to be inserted.
   return true;
 }

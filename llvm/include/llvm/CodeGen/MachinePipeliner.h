@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Modifications (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its
+// affiliates
+//
 //===----------------------------------------------------------------------===//
 //
 // An implementation of the Swing Modulo Scheduling (SMS) software pipeliner.
@@ -57,6 +60,7 @@ namespace llvm {
 class AAResults;
 class NodeSet;
 class SMSchedule;
+class HighRegisterPressureDetector;
 
 extern cl::opt<bool> SwpEnableCopyToPhi;
 extern cl::opt<int> SwpForceIssueWidth;
@@ -305,6 +309,9 @@ private:
                          SetVector<SUnit *> &NodesAdded);
   void computeNodeOrder(NodeSetType &NodeSets);
   void checkValidNodeOrder(const NodeSetType &Circuits) const;
+  bool tryScheduleWithII(SMSchedule &Schedule, unsigned II,
+                         ArrayRef<ArrayRef<SUnit *>> NodeOrders,
+                         const HighRegisterPressureDetector *HRPDetector);
   bool schedulePipeline(SMSchedule &Schedule);
   bool computeDelta(MachineInstr &MI, unsigned &Delta);
   MachineInstr *findDefInLoop(Register Reg);
@@ -452,7 +459,7 @@ private:
   SwingSchedulerDAG *DAG;
   const bool UseDFA;
   /// DFA resources for each slot
-  llvm::SmallVector<std::unique_ptr<DFAPacketizer>> DFAResources;
+  llvm::SmallVector<std::unique_ptr<ResourceCycle>> DFAResources;
   /// Modulo Reservation Table. When a resource with ID R is consumed in cycle
   /// C, it is counted in MRT[C mod II][R]. (Used when UseDFA == F)
   llvm::SmallVector<llvm::SmallVector<uint64_t, DefaultProcResSize>> MRT;

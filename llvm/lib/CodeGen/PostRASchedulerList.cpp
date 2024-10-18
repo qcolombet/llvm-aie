@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Modifications (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its
+// affiliates
+//
 //===----------------------------------------------------------------------===//
 //
 // This implements a top-down list scheduler, using standard algorithms.
@@ -39,6 +42,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/TargetMachine.h"
 using namespace llvm;
 
 #define DEBUG_TYPE "post-RA-sched"
@@ -275,7 +279,8 @@ bool PostRAScheduler::enablePostRAScheduler(
 }
 
 bool PostRAScheduler::runOnMachineFunction(MachineFunction &Fn) {
-  if (skipFunction(Fn.getFunction()))
+  bool SchedulingRequired = Fn.getSubtarget().forcePostRAScheduling();
+  if (!SchedulingRequired && skipFunction(Fn.getFunction()))
     return false;
 
   TII = Fn.getSubtarget().getInstrInfo();
@@ -374,6 +379,7 @@ bool PostRAScheduler::runOnMachineFunction(MachineFunction &Fn) {
 void SchedulePostRATDList::startBlock(MachineBasicBlock *BB) {
   // Call the superclass.
   ScheduleDAGInstrs::startBlock(BB);
+  HazardRec->StartBlock(BB);
 
   // Reset the hazard recognizer and anti-dep breaker.
   HazardRec->Reset();
@@ -430,6 +436,7 @@ void SchedulePostRATDList::finishBlock() {
   if (AntiDepBreak)
     AntiDepBreak->FinishBlock();
 
+  HazardRec->EndBlock(BB);
   // Call the superclass.
   ScheduleDAGInstrs::finishBlock();
 }
@@ -465,7 +472,7 @@ void SchedulePostRATDList::ReleaseSucc(SUnit *SU, SDep *SuccEdge) {
 
   // Standard scheduler algorithms will recompute the depth of the successor
   // here as such:
-  //   SuccSU->setDepthToAtLeast(SU->getDepth() + SuccEdge->getLatency());
+  SuccSU->setDepthToAtLeast(SU->getDepth() + SuccEdge->getLatency());
   //
   // However, we lazily compute node depth instead. Note that
   // ScheduleNodeTopDown has already updated the depth of this node which causes
@@ -563,7 +570,8 @@ void SchedulePostRATDList::ListScheduleTopDown() {
                AvailableQueue.dump(this));
 
     SUnit *FoundSUnit = nullptr, *NotPreferredSUnit = nullptr;
-    bool HasNoopHazards = false;
+
+    bool HasNoopHazards = HazardRec->emitNoopsIfNoInstructionsAvailable();
     while (!AvailableQueue.empty()) {
       SUnit *CurSUnit = AvailableQueue.pop();
 
@@ -651,6 +659,25 @@ void SchedulePostRATDList::ListScheduleTopDown() {
       CycleHasInsts = false;
     }
   }
+
+  // BEGIN AIE Hack
+  // Currently, AIE uses PostRA scheduling to insert architecturally required NOOPS.
+  // However, normally scheduling does not generate any NOOPS before the final instruction.
+  // Without this, we tend to miss the connection between loads of the Link Register (LR)
+  // and return(RET) instructions.
+  // Emit Noops before the ExitSU
+  if (CycleHasInsts) {
+    HazardRec->AdvanceCycle();
+    ++CurCycle;
+  }
+  bool HasNoopHazards = HazardRec->emitNoopsIfNoInstructionsAvailable();
+  if (HasNoopHazards) {
+    unsigned Depth = ExitSU.getDepth();
+    while (CurCycle < Depth) {
+      emitNoop(CurCycle++);
+    }
+  }
+  // END AIE Hack
 
 #ifndef NDEBUG
   unsigned ScheduledNodes = VerifyScheduledDAG(/*isBottomUp=*/false);

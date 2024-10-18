@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Modifications (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its
+// affiliates
+//
 //===----------------------------------------------------------------------===//
 //
 // This file provides an interface for customizing the standard MachineScheduler
@@ -122,6 +125,7 @@ class ScheduleHazardRecognizer;
 class TargetInstrInfo;
 class TargetPassConfig;
 class TargetRegisterInfo;
+class SchedBoundary;
 
 /// MachineSchedContext provides enough context from the MachineScheduler pass
 /// for the target to instantiate a scheduler.
@@ -238,11 +242,36 @@ public:
   /// Initialize the strategy after building the DAG for a new region.
   virtual void initialize(ScheduleDAGMI *DAG) = 0;
 
+  /// Per-function initialization
+  virtual void enterFunction(MachineFunction *MF) {
+    CurrFn = MF;
+    NextMBB = CurrFn->begin();
+  }
+
+  /// Per function finalization
+  virtual void leaveFunction() {
+    assert(NextMBB == CurrFn->end());
+    CurrFn = nullptr;
+  }
+
+  virtual MachineBasicBlock *nextBlock() {
+    return NextMBB == CurrFn->end() ? nullptr : &(*NextMBB++);
+  }
+
   /// Tell the strategy that MBB is about to be processed.
-  virtual void enterMBB(MachineBasicBlock *MBB) {};
+  virtual void enterMBB(MachineBasicBlock *MBB) {}
 
   /// Tell the strategy that current MBB is done.
-  virtual void leaveMBB() {};
+  virtual void leaveMBB() {}
+
+  /// This can override DAG construction and postprocessing
+  /// This is useful for iterative scheduling, where the graph is invariant
+  /// over multiple schedule() calls.
+  virtual void buildGraph(ScheduleDAGMI &DAG, AAResults *AA,
+                          RegPressureTracker *RPTracker = nullptr,
+                          PressureDiffs *PDiffs = nullptr,
+                          LiveIntervals *LIS = nullptr,
+                          bool TrackLaneMasks = false);
 
   /// Notify this strategy that all roots have been released (including those
   /// that depend on EntrySU or ExitSU).
@@ -252,6 +281,26 @@ public:
   /// schedule the node at the top of the unscheduled region. Otherwise it will
   /// be scheduled at the bottom.
   virtual SUnit *pickNode(bool &IsTopNode) = 0;
+
+  /// Variant of \p pickNode which allows specifying a cycle in which to emit
+  /// the instruction. This only works for bottom nodes, i.e. when \p IsTopNode
+  /// is false. Targets that implement pickNodeAndCycle are required to either
+  /// set a \p BotEmissionCycle for all "bottom" nodes, or for none.
+  /// If \p BotEmissionCycle is left unchanged, the SU will be emitted in the
+  /// current cycle.
+  virtual SUnit *pickNodeAndCycle(bool &IsTopNode,
+                                  std::optional<unsigned> &BotEmissionCycle) {
+    return pickNode(IsTopNode);
+  }
+
+  /// Whether or not \p SU can be moved to the Available queue of \p Zone.
+  ///
+  /// This will typically check if \p SU has a hazard with any instruction
+  /// already scheduled in \p Zone using Zone.checkHazard(), but can be
+  /// overridden by schedulers that try to release successors/predecessors early
+  /// to schedule "out of order".
+  virtual bool isAvailableNode(SUnit &SU, SchedBoundary &Zone,
+                               bool VerifyReadyCycle);
 
   /// Scheduler callback to notify that a new subtree is scheduled.
   virtual void scheduleTree(unsigned SubtreeID) {}
@@ -267,6 +316,10 @@ public:
   /// When all successor dependencies have been resolved, free this node for
   /// bottom-up scheduling.
   virtual void releaseBottomNode(SUnit *SU) = 0;
+
+private:
+  MachineFunction *CurrFn;
+  MachineFunction::iterator NextMBB;
 };
 
 /// ScheduleDAGMI is an implementation of ScheduleDAGInstrs that simply
@@ -281,6 +334,10 @@ protected:
 
   /// Ordered list of DAG postprocessing steps.
   std::vector<std::unique_ptr<ScheduleDAGMutation>> Mutations;
+
+  /// Instructions for which pickNodeAndCycle() requested an explicit emission
+  /// cycle in the Bot zone.
+  DenseMap<const SUnit *, unsigned> BotEmissionCycles;
 
   /// The top of the unscheduled zone.
   MachineBasicBlock::iterator CurrentTop;
@@ -314,6 +371,16 @@ public:
     return SchedImpl->doMBBSchedRegionsTopDown();
   }
 
+  /// Initialize function-wide data
+  void startSchedule(MachineFunction *MF) override;
+
+  /// Finalize function-wide data
+  void finalizeSchedule() override;
+
+  /// Supply the scheduling order of blocks. The target can decide to schedule
+  /// the same block multiple times. Return nullptr when done.
+  MachineBasicBlock *nextBlock() override;
+
   // Returns LiveIntervals instance for use in DAG mutators and such.
   LiveIntervals *getLIS() const { return LIS; }
 
@@ -341,12 +408,22 @@ public:
                    MachineBasicBlock::iterator end,
                    unsigned regioninstrs) override;
 
+  /// Apply each ScheduleDAGMutation step in order. This allows different
+  /// instances of ScheduleDAGMI to perform custom DAG postprocessing.
+  void postProcessDAG();
+
   /// Implement ScheduleDAGInstrs interface for scheduling a sequence of
   /// reorderable instructions.
   void schedule() override;
 
   void startBlock(MachineBasicBlock *bb) override;
   void finishBlock() override;
+
+  /// Change the position of a picked SU.
+  /// This will figure out the right insertion point in the Top or Bot zone
+  /// and eventually call \p moveInstruction.
+  void movePickedSU(const SUnit &SU, bool IsTopNode,
+                    std::optional<unsigned> BotEmissionCycle);
 
   /// Change the position of an instruction within the basic block and update
   /// live ranges and region boundary iterators.
@@ -362,10 +439,6 @@ public:
 protected:
   // Top-Level entry points for the schedule() driver...
 
-  /// Apply each ScheduleDAGMutation step in order. This allows different
-  /// instances of ScheduleDAGMI to perform custom DAG postprocessing.
-  void postProcessDAG();
-
   /// Release ExitSU predecessors and setup scheduler queues.
   void initQueues(ArrayRef<SUnit*> TopRoots, ArrayRef<SUnit*> BotRoots);
 
@@ -373,7 +446,7 @@ protected:
   void updateQueues(SUnit *SU, bool IsTopNode);
 
   /// Reinsert debug_values recorded in ScheduleDAGInstrs::DbgValues.
-  void placeDebugValues();
+  virtual void placeDebugValues();
 
   /// dump the scheduled Sequence.
   void dumpSchedule() const;
@@ -387,10 +460,16 @@ protected:
   void findRootsAndBiasEdges(SmallVectorImpl<SUnit*> &TopRoots,
                              SmallVectorImpl<SUnit*> &BotRoots);
 
-  void releaseSucc(SUnit *SU, SDep *SuccEdge);
+  virtual void releaseSucc(SUnit *SU, SDep *SuccEdge);
   void releaseSuccessors(SUnit *SU);
-  void releasePred(SUnit *SU, SDep *PredEdge);
+  virtual void releasePred(SUnit *SU, SDep *PredEdge);
   void releasePredecessors(SUnit *SU);
+
+  /// Find the insertion point for a newly-picked SU in the Bot zone.
+  /// If an \p EmissionCycle is provided, this will ensure that the insertion
+  /// point is above any instruction which has been emitted in a lower cycle.
+  MachineBasicBlock::iterator
+  findBottomInsertPosForCycle(std::optional<unsigned> EmissionCycle);
 };
 
 /// ScheduleDAGMILive is an implementation of ScheduleDAGInstrs that schedules
@@ -839,6 +918,7 @@ public:
   };
 
   ScheduleDAGMI *DAG = nullptr;
+  MachineSchedStrategy *SchedImpl = nullptr;
   const TargetSchedModel *SchedModel = nullptr;
   SchedRemainder *Rem = nullptr;
 
@@ -950,8 +1030,8 @@ public:
 
   void reset();
 
-  void init(ScheduleDAGMI *dag, const TargetSchedModel *smodel,
-            SchedRemainder *rem);
+  void init(ScheduleDAGMI *DAG, MachineSchedStrategy *SchedImpl,
+            const TargetSchedModel *SModel, SchedRemainder *Rem);
 
   bool isTop() const {
     return Available.getID() == TopQID;
@@ -1020,7 +1100,7 @@ public:
            !SchedModel->getProcResource(PIdx)->BufferSize;
   }
 
-  bool checkHazard(SUnit *SU);
+  bool checkHazard(SUnit *SU, int DeltaCycles = 0);
 
   unsigned findMaxLatency(ArrayRef<SUnit*> ReadySUs);
 
@@ -1045,7 +1125,13 @@ public:
                          unsigned Cycles, unsigned ReadyCycle,
                          unsigned StartAtCycle);
 
-  void bumpNode(SUnit *SU);
+  /// Track effects of moving \p SU to the scheduled boundary of the Region.
+  /// This in particular notifies \p HazardRecognizer and can update the current
+  /// cycle depending on the scheduling model.
+  ///
+  /// \param DeltaCycles is the signed distance from the current cycle to the
+  ///   emission cycle. It is mainly used to correctly update the scoreboard.
+  void bumpNode(SUnit *SU, int DeltaCycles = 0);
 
   void releasePending();
 
@@ -1346,7 +1432,13 @@ public:
 protected:
   virtual bool tryCandidate(SchedCandidate &Cand, SchedCandidate &TryCand);
 
+  /// Pick the best candidate from the available list of \p Zone.
   void pickNodeFromQueue(SchedBoundary &Zone, SchedCandidate &Cand);
+
+  /// Pick an SU from a single zone. This will bump the cycle until at
+  /// least one candidate is available.
+  /// See GenericScheduler::pickNodeBidirectional() for "bidirectional" picking.
+  SUnit *pickNodeUnidirectional(SchedBoundary &Zone);
 };
 
 /// Create the standard converging machine scheduler. This will be used as the

@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Modifications (c) Copyright 2023-2024 Advanced Micro Devices, Inc. or its
+// affiliates
+//
 //===----------------------------------------------------------------------===//
 //
 // This file defines the RAGreedy function pass for register allocation in
@@ -22,6 +25,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/IndexedMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
@@ -145,6 +149,11 @@ static cl::opt<unsigned> SplitThresholdForRegWithHint(
     cl::desc("The threshold for splitting a virtual register with a hint, in "
              "percentate"),
     cl::init(75), cl::Hidden);
+
+static cl::opt<bool> PreferPreviousRAAssignment(
+    "greedy-prefer-previous-assignments",
+    cl::desc("Maintain preference for phys regs assigned in previous RA runs"),
+    cl::init(true), cl::Hidden);
 
 static RegisterRegAlloc greedyRegAlloc("greedy", "greedy register allocator",
                                        createGreedyRegisterAllocator);
@@ -300,6 +309,10 @@ void RAGreedy::enqueue(PQueue &CurQueue, const LiveInterval *LI) {
   // The virtual register number is a tie breaker for same-sized ranges.
   // Give lower vreg numbers higher priority to assign them first.
   CurQueue.push(std::make_pair(Ret, ~Reg));
+}
+
+void RAGreedy::noteAllocatedReg(const LiveInterval *LI) {
+  ExtraInfo->setStage(*LI, RS_Split);
 }
 
 unsigned DefaultPriorityAdvisor::getPriority(const LiveInterval &LI) const {
@@ -1338,8 +1351,11 @@ unsigned RAGreedy::tryBlockSplit(const LiveInterval &VirtReg,
 static unsigned getNumAllocatableRegsForConstraints(
     const MachineInstr *MI, Register Reg, const TargetRegisterClass *SuperRC,
     const TargetInstrInfo *TII, const TargetRegisterInfo *TRI,
-    const RegisterClassInfo &RCI) {
+    const RegisterClassInfo &RCI, const VirtRegMap &VRM) {
   assert(SuperRC && "Invalid register class");
+
+  if (VRM.hasRequiredPhys(Reg))
+    return 1;
 
   const TargetRegisterClass *ConstrainedRC =
       MI->getRegClassConstraintEffectForVReg(Reg, SuperRC, TII, TRI,
@@ -1451,8 +1467,8 @@ unsigned RAGreedy::tryInstructionSplit(const LiveInterval &VirtReg,
       if (TII->isFullCopyInstr(*MI) ||
           (SplitSubClass &&
            SuperRCNumAllocatableRegs ==
-               getNumAllocatableRegsForConstraints(MI, VirtReg.reg(), SuperRC,
-                                                   TII, TRI, RegClassInfo)) ||
+               getNumAllocatableRegsForConstraints(
+                   MI, VirtReg.reg(), SuperRC, TII, TRI, RegClassInfo, *VRM)) ||
           // TODO: Handle split for subranges with subclass constraints?
           (!SplitSubClass && VirtReg.hasSubRanges() &&
            !readsLaneSubset(*MRI, MI, VirtReg, TRI, Use, TII))) {
@@ -2164,6 +2180,20 @@ MCRegister RAGreedy::selectOrSplit(const LiveInterval &VirtReg,
                     "depth for recoloring reached. Use "
                     "-fexhaustive-register-search to skip cutoffs");
   }
+
+  for (Register VReg : NewVRegs) {
+    if (!VRM->hasRequiredPhys(VReg)) {
+      continue;
+    }
+    if (none_of(MRI->reg_instructions(VReg), [](const MachineInstr &MI) {
+          return MI.hasExtraDefRegAllocReq() || MI.hasExtraSrcRegAllocReq();
+        })) {
+      if (PreferPreviousRAAssignment)
+        MRI->setSimpleHint(VReg, VRM->getRequiredPhys(VReg));
+      VRM->unsetRequiredPhys(VReg);
+    }
+  }
+
   return Reg;
 }
 
@@ -2312,6 +2342,10 @@ void RAGreedy::tryHintRecoloring(const LiveInterval &VirtReg) {
              "We have an unallocated variable which should have been handled");
       continue;
     }
+
+    // Cannot recolor registers that have a required assignment.
+    if (VRM->hasRequiredPhys(Reg))
+      continue;
 
     // Get the live interval mapped with this virtual register to be able
     // to check for the interference with the new color.
