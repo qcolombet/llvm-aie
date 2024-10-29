@@ -399,14 +399,14 @@ let hasSideEffects = false, mayLoad = true, mayStore = false in {
 
   // Note: using a GPR dependency to connect .prep to .pop
   let Itinerary = II_VLDB_POSTINC_PREP, Slot = ldb_slot in
-  def VLDB_pstm_imm_prep : Pseudo< (outs eR:$dst_sentinel, eP:$ptr_out) , (ins eP:$ptr, imm4x32:$imm),
-      "vldb.prep", "$dst_sentinel, [$ptr], $imm">,
+  def VLDB_pstm_imm_prep : Pseudo< (outs FIFO:$fifo, eP:$ptr_out) , (ins eP:$ptr, imm4x32:$imm),
+      "vldb.prep", "$fifo, [$ptr], $imm">,
   AIE2_ag_nospill__ag_pstm_nrm_imm;
 
   let Itinerary = II_VLDB_POSTINC_POP, isMeta = true in
   let mayLoad = false in
-  def VLDB_pstm_imm_pop : Pseudo< (outs mWa:$dst) , (ins eR:$sentinel),
-      "vldb.pop", "$dst, $sentinel">,
+  def VLDB_pstm_imm_pop : Pseudo< (outs mWa:$dst) , (ins FIFO:$fifo),
+      "vldb.pop", "$dst, $fifo">,
   AIE2_ag_nospill__ag_pstm_nrm_imm;
 
   let Itinerary = II_VLDB_2D in

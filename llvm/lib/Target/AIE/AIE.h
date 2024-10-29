@@ -58,6 +58,8 @@ MachineFunctionPass *createAIEAddressSpaceFlattening();
 MachineFunctionPass *createAIEEliminateDuplicatePHI();
 FunctionPass *createAIESuperRegRewriter();
 FunctionPass *createAIEPostSelectOptimize();
+FunctionPass *createAIEPipelinePHIElimination();
+FunctionPass *createAIEFifoMerger();
 MachineFunctionPass *
 createDeadMachineInstructionElim(bool KeepLifetimeInstructions);
 
@@ -90,6 +92,8 @@ llvm::FunctionPass *createAIESplitInstrBuilder();
 
 extern char &AIESplitInstrReplacerID;
 void initializeAIESplitInstrReplacerPass(PassRegistry &);
+void initializeAIEPipelinePHIEliminationPass(PassRegistry &);
+void initializeAIEFifoMergerPass(PassRegistry &);
 llvm::FunctionPass *createAIESplitInstrReplacer();
 
 extern char &ReservedRegsLICMID;

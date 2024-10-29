@@ -114,6 +114,8 @@ add_llvm_target(AIECodeGen
    AIE2TargetMachine.cpp
    AIE2TargetTransformInfo.cpp
    AIETiedRegOperands.cpp
+   AIEPipelinePHIElimination.cpp
+   AIEFifoMerger.cpp
    ReservedRegsLICM.cpp
 
    LINK_COMPONENTS

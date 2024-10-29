@@ -107,6 +107,7 @@ BitVector AIE2RegisterInfo::getReservedRegs(const MachineFunction &MF) const {
 
   ReserveRegs(AIE2::eRRegClass, ReservedGPRs);
   ReserveRegs(AIE2::eDRegClass, ReservedMODs);
+  ReserveRegs(AIE2::FIFORegClass, 1024);
 
   // CORE_ID is reserved.
   markSuperRegs(Reserved, AIE2::CORE_ID);

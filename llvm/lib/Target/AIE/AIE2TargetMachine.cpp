@@ -18,10 +18,12 @@
 #include "AIE2TargetTransformInfo.h"
 #include "AIEBaseAliasAnalysis.h"
 #include "AIEDumpArtifacts.h"
+#include "AIEFifoMerger.h"
 #include "AIEFinalizeBundle.h"
 #include "AIEMachineAlignment.h"
 #include "AIEMachineBlockPlacement.h"
 #include "AIEMachineFunctionInfo.h"
+#include "AIEPipelinePHIElimination.h"
 #include "AIETargetObjectFile.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/CodeGen/GlobalISel/IRTranslator.h"
@@ -160,6 +162,7 @@ void AIE2PassConfig::addPreRegAlloc() {
     addPass(&MachinePipelinerID);
     // Remove unused debris afer SWP
     addPass(&DeadMachineInstructionElimID);
+    addPass(createAIEPipelinePHIElimination());
   }
   insertPass(&PHIEliminationID, &AIESubRegConstrainerID);
   if (AIEDumpArtifacts) {
@@ -206,6 +209,7 @@ bool AIE2PassConfig::addRegAssignAndRewriteOptimized() {
   }
   addPass(createGreedyRegisterAllocator());
   addPass(createVirtRegRewriter());
+  addPass(createAIEFifoMerger());
 
   return true;
 }

@@ -488,6 +488,10 @@ class AIE2Dim3DRegisterClass <dag reglist, RegAltNameIndex idx = NoRegAltName> :
     let HWEncoding{1 - 0} = Enc;
   }
 
+  foreach Index = 0-1023 in {
+    def fifo#Index : AIE2Reg<"fifo" #Index>;
+  }
+
   def s0 : AIE2ShiftReg<0b00, "s0">, DwarfRegNum<[267]>;
   def s1 : AIE2ShiftReg<0b01, "s1">, DwarfRegNum<[269]>;
   def s2 : AIE2ShiftReg<0b10, "s2">, DwarfRegNum<[271]>;
@@ -710,6 +714,7 @@ let GeneratePressureSet = false in {
   def mSclMS : AIE2ScalarRegisterClass<(add eR, mDm, eP)>;
 
   def mShflDst   : AIE2Vector512RegisterClass<(add mXm, mBMSm)>;
+  def FIFO : AIE2ScalarRegisterClass<(sequence "fifo%u", 0, 1023)>;
 
 // VMOV register classes
 // These classes only encode operand constraints, and will be constrained before
